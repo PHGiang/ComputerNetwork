@@ -6,18 +6,29 @@ import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
+import java.awt.image.BufferedImage;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.InterruptedIOException;
 import java.io.OutputStreamWriter;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.Iterator;
 import java.util.StringTokenizer;
 import java.util.UUID;
 
+import javax.imageio.IIOImage;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageWriteParam;
+import javax.imageio.ImageWriter;
+import javax.imageio.stream.ImageOutputStream;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.Timer;
@@ -73,6 +84,17 @@ public class Server extends JFrame implements ActionListener{
 	static String RTSPid = UUID.randomUUID().toString(); 
 	int RTSPSeqNb = 0; 
 	
+	//RTCP variables 
+	static int RTCP_RCV_PORT = 19001; 
+	static int RTCP_PERIOD = 400; 
+	DatagramSocket RTCPsocket; 
+	RtcpReceiver rtcpReceiver; 
+	//Performance optimization and congestion controller
+	int congestionLevel; 
+	CongestionController cc; 
+	ImageTranslator imgTranslator; 
+	
+	
 	final static String CRLF = "\r\n"; 
 	
 	public Server() {
@@ -84,19 +106,25 @@ public class Server extends JFrame implements ActionListener{
 		timer.setInitialDelay(0);
 		timer.setCoalesce(true);
 		
+		cc = new CongestionController(600); 
 		buf = new byte[20000]; 
 		
 		addWindowListener(new WindowAdapter() {
 			public void windowClosing(WindowEvent e) {
 				timer.stop();
+				rtcpReceiver.stopRcv();
 				System.exit(0);
 			}
 		});
 		
+		//Init RTCP packet receiver
+		rtcpReceiver = new RtcpReceiver(RTCP_PERIOD); 
+		
 		//GUI 
 		label = new JLabel("Send frame #        ", JLabel.CENTER); 
 		getContentPane().add(label, BorderLayout.CENTER); 
-		
+		//Video encoding and quality
+		imgTranslator = new ImageTranslator(0.8f); 
 	}
 	
 	public static void main(String argv[]) throws Exception{
@@ -149,6 +177,7 @@ public class Server extends JFrame implements ActionListener{
 				
 				//init RTP sockets 
 				server.RTPsocket = new DatagramSocket();
+				server.RTCPsocket = new DatagramSocket(RTCP_RCV_PORT); 
 			}
 		}
 		while (true) {
@@ -160,6 +189,7 @@ public class Server extends JFrame implements ActionListener{
 				
 				//start timer 
 				server.timer.start();
+				server.rtcpReceiver.startRcv();
 				
 				//update state 
 				state = PLAYING; 
@@ -170,6 +200,7 @@ public class Server extends JFrame implements ActionListener{
 				server.sendResponse();
 				//stop timer
 				server.timer.stop();
+				server.rtcpReceiver.stopRcv();
 				//update state 
 				state = READY; 
 				System.out.println("New RTSP state: READY"); 
@@ -180,8 +211,11 @@ public class Server extends JFrame implements ActionListener{
 				
 				//stop timer 
 				server.timer.stop();
+				server.rtcpReceiver.stopRcv();
 				//close socket 
 				server.RTPsocket.close();
+				server.RTSPsocket.close();
+				server.RTCPsocket.close();
 				System.exit(0);
 			}
 		}
@@ -308,5 +342,134 @@ public class Server extends JFrame implements ActionListener{
 		else {
 			timer.stop();
 		}
-	} 	
+	}
+	class RtcpReceiver implements ActionListener {
+		private Timer rtcpTimer; 
+		private byte[] rtcpBuf;
+		int interval; 
+		
+		public RtcpReceiver(int interval) {
+			//setup timer 
+			this.interval = interval; 
+			rtcpTimer = new Timer(interval, this); 
+			rtcpTimer.setInitialDelay(0);
+			rtcpTimer.setCoalesce(true);
+			
+			//allocate buffer to receivering RTCP packet
+			rtcpBuf = new byte[512]; 
+		}
+		@Override
+		public void actionPerformed(ActionEvent e) {
+			// TODO Auto-generated method stub
+			//UDP packet to receive RTCP messages 
+			DatagramPacket dp = new DatagramPacket(rtcpBuf, rtcpBuf.length); 
+			float fractionLost; 
+			try {
+				RTCPsocket.receive(dp);
+				RTCPpacket rtcpPkt = new RTCPpacket(dp.getData(), dp.getLength()); 
+				System.out.println("[RTCP] " + rtcpPkt); 
+				
+				//set congestion level between 0 and 4
+				fractionLost = rtcpPkt.fractionLost; 
+				if (fractionLost >= 0 && fractionLost <= 0.01) {
+					congestionLevel = 0; 
+				}
+				else if (fractionLost > 0.01 && fractionLost <= 0.25) {
+					congestionLevel = 1; 
+				}
+				else if (fractionLost > 0.25 && fractionLost <= 0.5) {
+					congestionLevel = 2; 
+				}
+				else if (fractionLost > 0.5 && fractionLost <= 0.75) {
+					congestionLevel = 3; 
+				}
+				else {
+					congestionLevel = 4; 
+				}
+			} 
+			catch(InterruptedIOException iioe) {
+				System.out.println("Nothing to read"); 
+			}
+			catch(IOException ioe) {
+				System.out.println("Exception caught: " + ioe); 
+			}
+		}
+		
+		public void startRcv() {
+			rtcpTimer.start();
+		}
+		
+		public void stopRcv() {
+			rtcpTimer.stop();
+		}
+	}
+	
+	private class CongestionController implements ActionListener {
+		private Timer ccTimer; 
+		int interval; 
+		int prevLevel;
+		public CongestionController(int interval) {
+			// TODO Auto-generated constructor stub
+			this.interval = interval; 
+			ccTimer = new Timer(interval, this); 
+			ccTimer.start();
+		}
+		@Override
+		public void actionPerformed(ActionEvent e) {
+			// TODO Auto-generated method stub
+			if (prevLevel != congestionLevel) {
+				sendDelay = FRAME_PERIOD + congestionLevel + (int)(FRAME_PERIOD * 0.1); 
+				timer.setDelay(sendDelay);
+				prevLevel = congestionLevel; 
+				System.out.println("Send delay change to: " + sendDelay);
+			}
+		}
+	}
+	
+	class ImageTranslator {
+		private float compressionQuality; 
+		private ByteArrayOutputStream baos; 
+		private BufferedImage image; 
+		private Iterator<ImageWriter> writers; 
+		private ImageWriter writer; 
+		private ImageWriteParam param; 
+		private ImageOutputStream ios; 
+		
+		public ImageTranslator(float cq) {
+			compressionQuality = cq; 
+			
+			try {
+				baos = new ByteArrayOutputStream(); 
+				ios = ImageIO.createImageOutputStream(baos); 
+				writers = ImageIO.getImageWritersByFormatName("jpeg"); 
+				writer = (ImageWriter)writers.next(); 
+				writer.setOutput(ios);
+				param = writer.getDefaultWriteParam(); 
+				param.setCompressionMode(ImageWriteParam.MODE_EXPLICIT);
+				param.setCompressionQuality(compressionQuality);
+			}
+			catch(Exception ex) {
+				System.out.println("Exception caught: " + ex); 
+				System.exit(0);
+			}
+		}
+		
+		public byte []compress (byte[] imageBytes) {
+			try {
+				baos.reset();
+				image = ImageIO.read(new ByteArrayInputStream(imageBytes)); 
+				writer.write(null, new IIOImage(image, null, null), param);
+			}
+			catch(Exception ex) {
+				System.out.println("Exception caught: " + ex); 
+				System.exit(0);
+			}
+			return baos.toByteArray(); 
+		}
+		
+		public void setCompressionQuality(float cq) {
+			compressionQuality = cq; 
+			param.setCompressionQuality(compressionQuality);
+		}
+	}
 }

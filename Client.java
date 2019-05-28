@@ -19,7 +19,9 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.SocketException;
+import java.text.DecimalFormat;
 import java.util.ArrayDeque;
+import java.util.Random;
 import java.util.StringTokenizer;
 
 import javax.swing.ImageIcon;
@@ -39,6 +41,11 @@ public class Client {
 	
 	JPanel mainPanel = new JPanel();
 	JPanel buttonPanel = new JPanel();
+	JLabel statLabel1 = new JLabel("Total bytes received: 0");
+	JLabel statLabel2 = new JLabel("Packets Lost: 0");
+	JLabel statLabel3 = new JLabel("Data Rate (bytes/second): 0"); 
+	
+	
 	JLabel iconLabel = new JLabel();
 	ImageIcon icon;
 	
@@ -72,6 +79,23 @@ public class Client {
 	//Video constants
 	static int MJPEG_TYPE = 26; 
 	
+	//RTCP variables 
+	DatagramSocket RTCPsocket; 
+	static int RTCP_RCV_PORT = 19001; 
+	static int RTCP_PERIOD = 400; 
+	RtcpSender rtcpSender; 
+	
+	//Static variables 
+	double statDataRate; 
+	int statTotalBytes; 
+	double statStartTime;
+	double statTotalPlayTime; 
+	int statExpRtpNb; 
+	float statFractionLost; 
+	int statCumLost;
+	int statHighSeqNb; 
+	
+	
 	public Client() {
 		// TODO Auto-generated constructor stub
 		f.addWindowListener(new WindowAdapter() {
@@ -91,13 +115,19 @@ public class Client {
 		
 		iconLabel.setIcon(null);
 		mainPanel.setLayout(null);
-		mainPanel.add(iconLabel, BorderLayout.CENTER); 
-		mainPanel.add(buttonPanel, BorderLayout.SOUTH); 
+		mainPanel.add(iconLabel); 
+		mainPanel.add(buttonPanel);
+		mainPanel.add(statLabel1); 
+		mainPanel.add(statLabel2);
+		mainPanel.add(statLabel3);		
 		
 		iconLabel.setBounds(0, 0, 380, 300);
 		buttonPanel.setBounds(0, 300, 380, 50);
+		statLabel1.setBounds(0, 350, 380, 20);
+		statLabel2.setBounds(0, 370, 380, 20);
+		statLabel3.setBounds(0, 390, 380, 20);
 		f.getContentPane().add(mainPanel, BorderLayout.CENTER); 
-		f.setSize(new Dimension(430, 370));
+		f.setSize(new Dimension(380, 430));
 		f.setLocation(0, 300);
 		f.setVisible(true);
 		
@@ -105,6 +135,9 @@ public class Client {
 		timer = new Timer(20, new timerListener()); 
 		timer.setInitialDelay(0);
 		timer.setCoalesce(true);
+		
+		//init RTCP packet sender 
+		rtcpSender = new RtcpSender(400); 
 		
 		//allocate enough memory for the buffered used to received data from server 
 		buf = new byte[15000]; 
@@ -142,7 +175,8 @@ public class Client {
 			if (state == INIT) {
 				System.out.println("state = " + state); 
 				try {
-					RTPsocket = new DatagramSocket(RTP_RCV_PORT); 
+					RTPsocket = new DatagramSocket(RTP_RCV_PORT);
+					RTCPsocket = new DatagramSocket(); 
 					RTPsocket.setSoTimeout(5);
 				}
 				catch(SocketException se) {
@@ -171,6 +205,7 @@ public class Client {
 		public void actionPerformed(ActionEvent arg0) {
 			// TODO Auto-generated method stub
 			System.out.println("Play button pressed!"); 
+			statStartTime = System.currentTimeMillis(); 
 			if (state == READY) {
 				RTSPSeqNb++; 
 				sendRequest("PLAY");
@@ -181,6 +216,7 @@ public class Client {
 					System.out.println("New RTSP state: PLAYING");
 					
 					timer.start();
+					rtcpSender.startSend();
 					
 				}
 			} //state != READY do nothing 
@@ -204,6 +240,7 @@ public class Client {
 					state = READY; 
 					System.out.println("New RTSP state: READY"); 
 					timer.stop();
+					rtcpSender.stopSend();
 				}
 			}
 		}
@@ -226,6 +263,7 @@ public class Client {
 					state = INIT;
 					System.out.println("New RTSP state: INIT");
 					timer.stop();
+					rtcpSender.stopSend();
 					System.exit(0);
 				}
 			}
@@ -304,6 +342,11 @@ public class Client {
 			
 			try {
 				RTPsocket.receive(rcvdp);
+				double curTime = System.currentTimeMillis(); 
+				statTotalPlayTime += curTime - statStartTime; 
+				statStartTime = curTime; 
+				
+				
 				RTPpacket rtp_packet = new RTPpacket(rcvdp.getData(), rcvdp.getLength()); 
 				int seqNb = rtp_packet.getSequenceNumber(); 
 				// print important header fields of the RTP packet received:
@@ -316,6 +359,22 @@ public class Client {
 				byte[]payload = new byte[payload_length]; 
 				rtp_packet.getPayload(payload); 
 
+				
+				//compute stats and update the label GUI 
+				statExpRtpNb++; 
+				if (seqNb > statHighSeqNb) {
+					statHighSeqNb = seqNb;
+				}
+				if (statExpRtpNb != seqNb) {
+					statCumLost++; 
+				}
+				
+				statDataRate = statTotalPlayTime == 0 ? 0 : statTotalBytes / statTotalPlayTime; 
+				statFractionLost = (float) statCumLost / statHighSeqNb; 
+				statTotalBytes += payload_length; 
+				updateStatsLabel(); 
+				
+				
 				//get image from payload stream 
 				Toolkit toolkit = Toolkit.getDefaultToolkit(); 
 				fsynch.addFrame(toolkit.createImage(payload, 0, payload_length), seqNb);
@@ -328,6 +387,16 @@ public class Client {
 			} catch(IOException ioe) {
 				System.out.println("Exception caught: " + ioe); 
 			}
+		}
+
+		private void updateStatsLabel() {
+			// TODO Auto-generated method stub
+			DecimalFormat formatter = new DecimalFormat("###,###.##");
+			statLabel1.setText("Total Bytes Received: " + statTotalBytes);
+			statLabel2.setText("Packet Lost Rate: " + formatter.format(statFractionLost));
+			statLabel3.setText("Data Rate: " + formatter.format(statDataRate));
+		
+			
 		}
 		
 	}
@@ -361,6 +430,66 @@ public class Client {
 			curSeqNb++; 
 			lastImage = queue.peekLast(); 
 			return (queue.remove()); 
+		}
+	}
+	
+	class RtcpSender implements ActionListener {
+		private Timer rtcpTimer; 
+		int interval; 
+		
+		//statistic variables 
+		private int numPktsExpected; 
+		private int numPktsLost; 
+		private int lastHighSeqNb; 
+		private int lastCumLost;
+		private float lastFractionLost; 
+		
+		Random randomGenerator; 
+		public RtcpSender(int interval) {
+			// TODO Auto-generated constructor stub
+			this.interval = interval; 
+			rtcpTimer = new Timer(interval, this); 
+			rtcpTimer.setInitialDelay(0);
+			rtcpTimer.setCoalesce(true);
+			
+			randomGenerator = new Random(); 
+		}
+		
+		public void run() {
+			System.out.println("RTCPSender thread running"); 
+		}
+		
+		@Override
+		public void actionPerformed(ActionEvent arg0) {
+			// TODO Auto-generated method stub
+			numPktsExpected = statHighSeqNb - lastHighSeqNb; 
+			numPktsLost = statCumLost - lastCumLost; 
+			lastFractionLost = numPktsExpected == 0 ? 0f : (float) numPktsLost/numPktsExpected; 
+			lastHighSeqNb = statHighSeqNb; 
+			lastCumLost = statCumLost; 
+			
+			//test lost feedback on lost packets 
+			RTCPpacket rtcp_packet = new RTCPpacket(lastFractionLost, statCumLost, statHighSeqNb); 
+			int packet_length = rtcp_packet.getLength(); 
+			byte[] packet_bits = new byte [packet_length]; 
+			rtcp_packet.getPacket(packet_bits); 
+			
+			try {
+				DatagramPacket dp = new DatagramPacket(packet_bits, packet_length, ServerIPAddress, RTCP_RCV_PORT); 
+				RTCPsocket.send(dp); 
+			}catch (InterruptedIOException iioe) {
+				System.out.println("Nothing to read");
+			} catch (IOException ioe) {
+				System.out.println("Exception caught: " + ioe);
+			}
+		}
+		
+		public void startSend() {
+			rtcpTimer.start();
+		}
+		
+		public void stopSend() {
+			rtcpTimer.stop();
 		}
 	}
 }
